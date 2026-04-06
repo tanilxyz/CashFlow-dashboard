@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from openpyxl.utils.cell import range_boundaries
 
-DEFAULT_FILE = "data\Group MIS working file.v4.xlsx"
+DEFAULT_FILE = "data/Group MIS working file.v4.xlsx"
 
 ENTITY_TABLES = {
     "A_INR": {
