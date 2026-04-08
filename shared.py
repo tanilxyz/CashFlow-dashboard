@@ -936,9 +936,10 @@ def run_app(entity_fixed: Optional[str] = None, default_file: str = DEFAULT_FILE
 
     st.sidebar.write(f"Opening cash ({entity}): {read_opening_cash(excel_path, ENTITY_TABLES[entity]['sheet']):,.2f}")
 
-    if st.button("🔄 Refresh Data"):
-        st.cache_data.clear()
-        st.rerun()
+    with st.sidebar:
+        if st.button("🔄 Refresh Data"):
+            st.cache_data.clear()
+            st.rerun()
 
     last_modified = os.path.getmtime(excel_path)
     st.sidebar.caption(f"Last updated: {pd.Timestamp.fromtimestamp(last_modified):%d %b %Y, %H:%M:%S}")
