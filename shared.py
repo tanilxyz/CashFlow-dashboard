@@ -520,7 +520,7 @@ def apply_visual_theme():
             }
 
             .block-container {
-                padding-top: 1rem;
+                padding-top: 4rem;
                 padding-bottom: 1.5rem;
             }
 
