@@ -11,7 +11,7 @@ import plotly.graph_objects as go
 import streamlit as st
 from openpyxl.utils.cell import range_boundaries
 
-DEFAULT_FILE = "data/Group MIS working file.v4.xlsx"
+DEFAULT_FILE = str(Path("data") / "Group MIS working file.v4.xlsx")
 
 ENTITY_TABLES = {
     "A_INR": {
@@ -424,7 +424,8 @@ def build_monthly_pnl(
     pnl["gross_profit"] = pnl["revenue"] - pnl["cogs"]
     pnl["opex"] = pnl["month_end"].map(opex_sum).fillna(0.0)
     pnl["scf_finance_cost"] = pnl["month_end"].map(scf).fillna(0.0)
-    pnl["ebitda"] = pnl["gross_profit"] - pnl["opex"] - pnl["scf_finance_cost"]
+    pnl["profit_loss"] = pnl["gross_profit"] - pnl["opex"] - pnl["scf_finance_cost"]
+    pnl["ebitda"] = pnl["profit_loss"]
     pnl["currency"] = currency
     return pnl
 
@@ -442,8 +443,11 @@ def build_overview_metrics(
     ar_open = ar.copy()
     if "receipt_status" in ar_open.columns:
         open_mask = ~ar_open["receipt_status"].astype(str).str.lower().eq("received")
+        received_mask = ar_open["receipt_status"].astype(str).str.lower().eq("received")
     else:
         open_mask = ar_open["cash_date"].notna()
+        received_mask = ar_open["cash_date"].notna()
+
     overdue_mask = open_mask & ar_open["cash_date"].notna() & (ar_open["cash_date"] < (start_date - pd.Timedelta(days=overdue_days)))
     missing_ar_cash = int(ar_open["cash_date"].isna().sum()) if "cash_date" in ar_open.columns else 0
     missing_ap_cash = int(ap["cash_date"].isna().sum()) if "cash_date" in ap.columns else 0
@@ -454,9 +458,28 @@ def build_overview_metrics(
     closing_cash = float(weekly["closing_cash"].iloc[-1]) if not weekly.empty else 0.0
     negative_weeks = int((weekly["closing_cash"] < 0).sum()) if not weekly.empty else 0
 
+    ar_base = pd.to_numeric(ar.get("invoice_value", ar.get("net_receipt_amount_clean", 0)), errors="coerce").fillna(0)
+    ar_received_base = pd.to_numeric(ar.get("net_receipt_amount_clean", ar.get("invoice_value", 0)), errors="coerce").fillna(0)
+    ap_base = pd.to_numeric(ap.get("amount_payable_clean", ap.get("amount_for_pnl", 0)), errors="coerce").fillna(0)
+    ap_paid_base = pd.to_numeric(ap.get("amount_for_pnl", ap.get("amount_payable_clean", 0)), errors="coerce").fillna(0)
+
+    ar_total_amount = float(ar_base.sum()) if len(ar_base) else 0.0
+    ar_received_amount = float(ar_received_base.loc[received_mask].sum()) if len(ar_received_base) else 0.0
+    ap_total_amount = float(ap_base.sum()) if len(ap_base) else 0.0
+    if "payment_status" in ap.columns:
+        paid_mask = ap["payment_status"].astype(str).str.lower().eq("paid")
+    else:
+        paid_mask = ap["cash_date"].notna()
+    ap_paid_amount = float(ap_paid_base.loc[paid_mask].sum()) if len(ap_paid_base) else 0.0
+
+    ar_received_pct = (ar_received_amount / ar_total_amount * 100.0) if ar_total_amount else 0.0
+    ap_paid_pct = (ap_paid_amount / ap_total_amount * 100.0) if ap_total_amount else 0.0
+
     large_ar = int(ar.loc[pd.to_numeric(ar.get("net_receipt_amount_clean", ar.get("invoice_value", 0)), errors="coerce").fillna(0).abs() >= large_exposure].shape[0])
     large_ap = int(ap.loc[pd.to_numeric(ap.get("amount_for_pnl", ap.get("amount_payable_clean", 0)), errors="coerce").fillna(0).abs() >= large_exposure].shape[0])
     large_opex = int(opex.loc[pd.to_numeric(opex.get("amount_for_pnl", opex.get("amount_clean", 0)), errors="coerce").fillna(0).abs() >= large_exposure].shape[0])
+
+    profit_loss_total = float(pnl["profit_loss"].sum()) if not pnl.empty and "profit_loss" in pnl.columns else float(pnl["ebitda"].sum()) if not pnl.empty and "ebitda" in pnl.columns else 0.0
 
     return {
         "total_inflows": total_inflows,
@@ -470,68 +493,328 @@ def build_overview_metrics(
         "large_ar": large_ar,
         "large_ap": large_ap,
         "large_opex": large_opex,
+        "ar_total_amount": ar_total_amount,
+        "ar_received_amount": ar_received_amount,
+        "ap_total_amount": ap_total_amount,
+        "ap_paid_amount": ap_paid_amount,
+        "ar_received_pct": ar_received_pct,
+        "ap_paid_pct": ap_paid_pct,
+        "profit_loss_total": profit_loss_total,
     }
 
 
 # ============================================================
 # Rendering
 # ============================================================
-def show_kpis(metrics: Dict[str, float], currency: str):
-    c1, c2, c3, c4 = st.columns(4)
-    c1.metric("Total inflows", format_money(metrics["total_inflows"], currency))
-    c2.metric("Total outflows", format_money(metrics["total_outflows"], currency))
-    c3.metric("Net movement", format_money(metrics["net_movement"], currency))
-    c4.metric("Closing cash", format_money(metrics["closing_cash"], currency))
-
-    c5, c6, c7, c8 = st.columns(4)
-    c5.metric("Negative weeks", metrics["negative_weeks"])
-    c6.metric("Overdue AR", metrics["overdue_ar"])
-    c7.metric("Missing AR cash dates", metrics["missing_ar_cash"])
-    c8.metric("Missing AP cash dates", metrics["missing_ap_cash"])
+def money_text(x, currency):
+    return format_money(x, currency)
 
 
-def plot_weekly(weekly: pd.DataFrame, currency: str):
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=weekly["week_start"], y=weekly["closing_cash"], mode="lines+markers", name="Closing Cash"))
-    fig.add_trace(go.Bar(x=weekly["week_start"], y=weekly["net"], name="Net Movement", opacity=0.45))
-    fig.update_layout(
-        title="Weekly cash trend",
-        xaxis_title="Week start",
-        yaxis_title=f"Cash ({currency})",
-        barmode="overlay",
-        height=420,
-        legend_orientation="h",
+def apply_visual_theme():
+    st.markdown(
+        """
+        <style>
+            .stApp {
+                background: #232845;
+                color: white;
+            }
+
+            .block-container {
+                padding-top: 1rem;
+                padding-bottom: 1.5rem;
+            }
+
+            .page-title {
+                font-size: 2.15rem;
+                font-weight: 800;
+                color: white;
+                margin-bottom: 0.25rem;
+            }
+
+            .page-subtitle {
+                color: #d5d9ea;
+                font-size: 0.95rem;
+                line-height: 1.35;
+                margin-bottom: 1rem;
+                max-width: 1200px;
+            }
+
+            .metric-card {
+                background: #2a3051;
+                border: 1px solid rgba(255,255,255,0.16);
+                border-radius: 4px;
+                overflow: hidden;
+                min-height: 116px;
+            }
+
+            .metric-head {
+                background: white;
+                color: #1f2431;
+                font-size: 0.92rem;
+                font-weight: 800;
+                text-align: center;
+                padding: 6px 8px;
+                border-bottom: 1px solid rgba(0,0,0,0.08);
+            }
+
+            .metric-body {
+                height: 76px;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                font-size: 1.75rem;
+                font-weight: 800;
+                color: white;
+                padding: 0 8px;
+                text-align: center;
+            }
+
+            .section-title {
+                color: white;
+                font-size: 1.15rem;
+                font-weight: 800;
+                text-align: center;
+                margin: 0.75rem 0 0.35rem 0;
+            }
+
+            .small-note {
+                color: #b8bdd6;
+                font-size: 0.82rem;
+            }
+
+            div[data-testid="stDataFrame"] {
+                border: 1px solid rgba(255,255,255,0.12);
+                border-radius: 6px;
+                overflow: hidden;
+            }
+        </style>
+        """,
+        unsafe_allow_html=True,
     )
-    st.plotly_chart(fig, use_container_width=True)
 
 
-def plot_monthly_pnl(pnl: pd.DataFrame, currency: str):
+def metric_card(title: str, value, currency: Optional[str] = None, is_number: bool = True) -> None:
+    if is_number and currency:
+        value_text = money_text(value, currency)
+    else:
+        value_text = str(value)
+
+    st.markdown(
+        f"""
+        <div class="metric-card">
+            <div class="metric-head">{title}</div>
+            <div class="metric-body">{value_text}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def aggregate_weekly_to_monthly_cash(weekly: pd.DataFrame) -> pd.DataFrame:
+    if weekly.empty:
+        return pd.DataFrame(columns=["month_end", "month_label", "cash_going_on", "cash_going_out", "ending_cash_on_hand", "profit_loss"])
+
+    df = weekly.copy()
+    df["month_end"] = pd.to_datetime(df["week_start"], errors="coerce").dt.to_period("M").dt.to_timestamp("M")
+    grouped = (
+        df.groupby("month_end", as_index=False)
+        .agg(
+            inflows=("inflows", "sum"),
+            ap_outflows=("ap_outflows", "sum"),
+            opex_outflows=("opex_outflows", "sum"),
+            net=("net", "sum"),
+            closing_cash=("closing_cash", "last"),
+            opening_cash=("opening_cash", "first"),
+        )
+        .sort_values("month_end")
+    )
+    grouped["cash_going_on"] = grouped["inflows"]
+    grouped["cash_going_out"] = grouped["ap_outflows"] + grouped["opex_outflows"]
+    grouped["ending_cash_on_hand"] = grouped["closing_cash"]
+    grouped["profit_loss"] = grouped["net"]
+    grouped["month_label"] = grouped["month_end"].dt.strftime("%b")
+    return grouped
+
+
+def make_cash_flow_chart(monthly_cash: pd.DataFrame, currency: str) -> go.Figure:
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=pnl["month_label"], y=pnl["revenue"], name="Revenue"))
-    fig.add_trace(go.Bar(x=pnl["month_label"], y=pnl["cogs"], name="COGS"))
-    fig.add_trace(go.Bar(x=pnl["month_label"], y=pnl["opex"], name="OPEX"))
-    fig.add_trace(go.Bar(x=pnl["month_label"], y=pnl["scf_finance_cost"], name="SCF fee"))
-    fig.add_trace(go.Scatter(x=pnl["month_label"], y=pnl["ebitda"], mode="lines+markers", name="EBITDA"))
+    fig.add_bar(
+        x=monthly_cash["month_label"],
+        y=monthly_cash["cash_going_on"],
+        name="Cash going on",
+        marker_color="#ff7a18",
+    )
+    fig.add_bar(
+        x=monthly_cash["month_label"],
+        y=monthly_cash["cash_going_out"],
+        name="Cash going out",
+        marker_color="#ff4fa3",
+    )
+    fig.add_scatter(
+        x=monthly_cash["month_label"],
+        y=monthly_cash["ending_cash_on_hand"],
+        name="Ending Cash on Hand",
+        mode="lines+markers",
+        line=dict(color="white", width=2.5),
+        marker=dict(symbol="square", size=8, color="white"),
+    )
+
     fig.update_layout(
-        title="Monthly P&L projection",
-        xaxis_title="Month",
-        yaxis_title=f"Amount ({currency})",
+        title=dict(text="<b>Cash Flow</b>", x=0.5, xanchor="center"),
         barmode="group",
-        height=420,
-        legend_orientation="h",
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="white"),
+        margin=dict(l=25, r=25, t=55, b=25),
+        height=360,
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        xaxis=dict(showgrid=False),
+        yaxis=dict(gridcolor="rgba(255,255,255,0.10)", title=f"Amount ({currency})"),
     )
-    st.plotly_chart(fig, use_container_width=True)
+    return fig
+
+
+def make_profit_loss_chart(pnl: pd.DataFrame, currency: str) -> go.Figure:
+    if pnl.empty:
+        fig = go.Figure()
+    else:
+        colors = ["#ffb07c" if v >= 0 else "#ff4fa3" for v in pnl["profit_loss"]]
+        fig = go.Figure()
+        fig.add_bar(
+            x=pnl["month_label"],
+            y=pnl["profit_loss"],
+            marker_color=colors,
+            name="Profit / Loss",
+        )
+        fig.add_hline(y=0, line_width=1, line_color="rgba(255,255,255,0.45)")
+
+    fig.update_layout(
+        title=dict(text="<b>Profit / Loss</b>", x=0.5, xanchor="center"),
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="white"),
+        margin=dict(l=25, r=25, t=55, b=25),
+        height=330,
+        xaxis=dict(showgrid=False),
+        yaxis=dict(gridcolor="rgba(255,255,255,0.10)", title=f"Amount ({currency})"),
+    )
+    return fig
+
+
+def make_donut_chart(title: str, amount, pct: float, center_label: str, fill_color: str) -> go.Figure:
+    pct = max(0, min(100, float(pct)))
+    fig = go.Figure(
+        data=[
+            go.Pie(
+                values=[pct, 100 - pct],
+                hole=0.72,
+                sort=False,
+                direction="clockwise",
+                rotation=90,
+                marker=dict(colors=[fill_color, "#2f3557"]),
+                textinfo="none",
+                hoverinfo="skip",
+                showlegend=False,
+            )
+        ]
+    )
+
+    fig.add_annotation(
+        x=0.5,
+        y=0.63,
+        text=f"<b>{amount:,.2f}</b>" if isinstance(amount, (int, float, np.integer, np.floating)) else f"<b>{amount}</b>",
+        showarrow=False,
+        font=dict(color="white", size=22),
+    )
+    fig.add_annotation(
+        x=0.5,
+        y=0.40,
+        text=f"<b>{pct:.0f}%</b><br>{center_label}",
+        showarrow=False,
+        font=dict(color="white", size=14),
+    )
+
+    fig.update_layout(
+        title=dict(text=f"<b>{title}</b>", x=0.5, xanchor="center"),
+        template="plotly_dark",
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        margin=dict(l=20, r=20, t=55, b=20),
+        height=330,
+    )
+    return fig
 
 
 def render_dashboard(entity: str, data: Dict[str, pd.DataFrame]):
     currency = ENTITY_TABLES[entity]["currency"]
-    st.title(f"{entity} Dashboard")
-    st.caption(f"Weekly cash forecast and monthly P&L projection in {currency}")
+    display_title = "Cash Flow Dashboard" if entity == "A_INR" else "Cash Flow Dashboard"
 
-    show_kpis(data["metrics"], currency)
+    apply_visual_theme()
 
+    st.markdown(f"<div class='page-title'>{display_title}</div>", unsafe_allow_html=True)
+    st.markdown(
+        """
+        <div class="page-subtitle">
+            Following slide covers cash flow dashboard covering details like beginning cash on hand,
+            cash going in, cash going out, profit/loss and ending cash on hand.
+            It also includes detail of accounts receivable and payable.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    opening_cash = data.get("opening_cash", 0.0)
+    metrics = data["metrics"]
+    pnl = data["pnl"]
+    weekly = data["weekly"]
+
+    c1, c2, c3, c4, c5 = st.columns(5)
+    with c1:
+        metric_card("Beginning Cash on Hand", opening_cash, currency=currency)
+    with c2:
+        metric_card("Cash going on", metrics["total_inflows"], currency=currency)
+    with c3:
+        metric_card("Cash going out", metrics["total_outflows"], currency=currency)
+    with c4:
+        metric_card("Profit / Loss", metrics["profit_loss_total"], currency=currency)
+    with c5:
+        metric_card("Ending Cash on Hand", metrics["closing_cash"], currency=currency)
+
+    st.write("")
+    monthly_cash = aggregate_weekly_to_monthly_cash(weekly)
+    st.plotly_chart(make_cash_flow_chart(monthly_cash, currency), use_container_width=True)
+
+    l1, l2, l3 = st.columns([1.25, 1, 1])
+    with l1:
+        st.plotly_chart(make_profit_loss_chart(pnl, currency), use_container_width=True)
+    with l2:
+        st.plotly_chart(
+            make_donut_chart(
+                "Accounts Receivable",
+                metrics["ar_received_amount"],
+                metrics["ar_received_pct"],
+                "Received",
+                "#ff4fa3",
+            ),
+            use_container_width=True,
+        )
+    with l3:
+        st.plotly_chart(
+            make_donut_chart(
+                "Accounts Payable",
+                metrics["ap_paid_amount"],
+                metrics["ap_paid_pct"],
+                "Paid",
+                "#ff9a56",
+            ),
+            use_container_width=True,
+        )
+
+    st.write("")
     st.subheader("Weekly cash forecast")
-    weekly_disp = data["weekly"][["week_no", "week_start", "week_end", "inflows", "ap_outflows", "opex_outflows", "net", "closing_cash"]].copy()
+    weekly_disp = weekly[["week_no", "week_start", "week_end", "inflows", "ap_outflows", "opex_outflows", "net", "closing_cash"]].copy()
     weekly_disp.columns = ["Week", "Week Start", "Week End", "Inflows", "AP Outflows", "OPEX Outflows", "Net", "Closing Cash"]
     st.dataframe(
         weekly_disp.style.format(
@@ -544,13 +827,12 @@ def render_dashboard(entity: str, data: Dict[str, pd.DataFrame]):
             }
         ),
         use_container_width=True,
-        height=320,
+        height=300,
     )
-    plot_weekly(data["weekly"], currency)
 
     st.subheader("Monthly P&L projection")
-    pnl_disp = data["pnl"][["month_label", "revenue", "cogs", "gross_profit", "opex", "scf_finance_cost", "ebitda"]].copy()
-    pnl_disp.columns = ["Month", "Revenue", "COGS", "Gross Profit", "OPEX", "SCF Finance Cost", "EBITDA"]
+    pnl_disp = pnl[["month_label", "revenue", "cogs", "gross_profit", "opex", "scf_finance_cost", "profit_loss"]].copy()
+    pnl_disp.columns = ["Month", "Revenue", "COGS", "Gross Profit", "OPEX", "SCF Finance Cost", "Profit / Loss"]
     st.dataframe(
         pnl_disp.style.format(
             {
@@ -559,13 +841,12 @@ def render_dashboard(entity: str, data: Dict[str, pd.DataFrame]):
                 "Gross Profit": lambda x: format_money(x, currency),
                 "OPEX": lambda x: format_money(x, currency),
                 "SCF Finance Cost": lambda x: format_money(x, currency),
-                "EBITDA": lambda x: format_money(x, currency),
+                "Profit / Loss": lambda x: format_money(x, currency),
             }
         ),
         use_container_width=True,
-        height=320,
+        height=300,
     )
-    plot_monthly_pnl(data["pnl"], currency)
 
     with st.expander("Cleaned source tables"):
         st.write("AR")
@@ -577,13 +858,13 @@ def render_dashboard(entity: str, data: Dict[str, pd.DataFrame]):
 
     st.download_button(
         "Download weekly forecast CSV",
-        data["weekly"].to_csv(index=False).encode("utf-8"),
+        weekly.to_csv(index=False).encode("utf-8"),
         file_name=f"{entity}_weekly_forecast.csv",
         mime="text/csv",
     )
     st.download_button(
         "Download monthly P&L CSV",
-        data["pnl"].to_csv(index=False).encode("utf-8"),
+        pnl.to_csv(index=False).encode("utf-8"),
         file_name=f"{entity}_monthly_pnl.csv",
         mime="text/csv",
     )
@@ -593,7 +874,7 @@ def render_dashboard(entity: str, data: Dict[str, pd.DataFrame]):
 # Pipeline
 # ============================================================
 @st.cache_data(show_spinner=False)
-def load_entity_dashboard(excel_path: str, entity: str) -> Dict[str, pd.DataFrame]:
+def load_entity_dashboard(excel_path: str, entity: str, mtime: float) -> Dict[str, pd.DataFrame]:
     if entity not in ENTITY_TABLES:
         raise ValueError(f"Unknown entity: {entity}")
 
@@ -663,7 +944,7 @@ def run_app(entity_fixed: Optional[str] = None, default_file: str = DEFAULT_FILE
     st.sidebar.caption(f"Last updated: {pd.Timestamp.fromtimestamp(last_modified):%d %b %Y, %H:%M:%S}")
 
     with st.spinner(f"Building {entity} dashboard..."):
-        data = load_entity_dashboard(excel_path, entity)
+        data = load_entity_dashboard(excel_path, entity, last_modified)
 
     render_dashboard(entity, data)
     st.caption(
